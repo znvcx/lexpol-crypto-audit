@@ -49,9 +49,7 @@ function biometricStorageKey(uid: string): string {
 export async function isBiometricUnlockSupported(): Promise<boolean> {
   if (typeof window === 'undefined' || !window.PublicKeyCredential) return false;
   try {
-    if (
-      typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === 'function'
-    ) {
+    if (typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === 'function') {
       return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
     }
     return false;
@@ -61,7 +59,9 @@ export async function isBiometricUnlockSupported(): Promise<boolean> {
 }
 
 /** Indique si un verrou biométrique est configuré sur cet appareil pour ce compte. */
-export async function hasBiometricVaultEnrollment(uid: string | null | undefined): Promise<boolean> {
+export async function hasBiometricVaultEnrollment(
+  uid: string | null | undefined
+): Promise<boolean> {
   if (!uid) return false;
   try {
     const rec = await deviceStoreGet<BiometricVaultRecord>(biometricStorageKey(uid));
