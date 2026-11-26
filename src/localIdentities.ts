@@ -13,7 +13,7 @@
  *   avec leurs vraies identités. Sur un autre appareil, la note ou le rapport reste 100 % fonctionnel
  *   avec ses alias.
  */
-import { Dossier, FieldNote, InvolvedEntity, NoteRecordEntry, ReformulationRecord } from '../types';
+import { FieldNote, InvolvedEntity, NoteRecordEntry, ReformulationRecord } from '../types';
 import { DEFAULT_NOTE_TEMPLATE } from '../utils/fieldNotes';
 import { readLocalVault, writeLocalVault } from '../utils/studioCrypto';
 import { auth } from './pocketbase';
@@ -323,65 +323,6 @@ export function hydrateReformulationWithLocalIdentities(
         return { ...rem, realName: loc.realName };
       }
       return rem;
-    }),
-  };
-}
-
-export async function prepareDossierForCloudSync(dossier: Dossier): Promise<Dossier> {
-  if (Array.isArray(dossier.reports) && dossier.reports.length > 0) {
-    const reg = loadRegistry();
-    const map: Record<string, InvolvedEntity[]> = reg.dossiers[dossier.id] || {};
-    for (const r of dossier.reports) {
-      if (Array.isArray(r.involvedEntities) && r.involvedEntities.length > 0) {
-        map[r.id] = r.involvedEntities.map((e) => ({ ...e }));
-      }
-    }
-    reg.dossiers[dossier.id] = map;
-    await saveRegistry(reg);
-  }
-  if (!isLocalIdentitiesOnlyEnabled()) return dossier;
-  return {
-    ...dossier,
-    ...(Array.isArray(dossier.reports)
-      ? {
-          reports: dossier.reports.map((r) => ({
-            ...r,
-            ...(Array.isArray(r.involvedEntities)
-              ? {
-                  involvedEntities: r.involvedEntities.map((e) => ({
-                    ...e,
-                    realName: e.alias,
-                    previousNames: undefined,
-                  })),
-                }
-              : {}),
-          })),
-        }
-      : {}),
-  };
-}
-
-export function hydrateDossierWithLocalIdentities(dossier: Dossier): Dossier {
-  if (!Array.isArray(dossier.reports) || dossier.reports.length === 0) return dossier;
-  const reg = loadRegistry();
-  const map = reg.dossiers[dossier.id];
-  if (!map) return dossier;
-  return {
-    ...dossier,
-    reports: dossier.reports.map((r) => {
-      const localEntities = map[r.id];
-      if (!Array.isArray(localEntities) || !Array.isArray(r.involvedEntities)) return r;
-      const byAlias = new Map(localEntities.map((e) => [e.alias, e]));
-      return {
-        ...r,
-        involvedEntities: r.involvedEntities.map((rem) => {
-          const loc = byAlias.get(rem.alias);
-          if (loc && (!rem.realName || rem.realName === rem.alias)) {
-            return { ...rem, realName: loc.realName };
-          }
-          return rem;
-        }),
-      };
     }),
   };
 }

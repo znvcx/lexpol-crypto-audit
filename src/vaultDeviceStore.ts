@@ -64,6 +64,32 @@ export async function deviceStoreSet(key: string, value: unknown): Promise<void>
   await run('readwrite', (s) => s.put(value, key));
 }
 
+/**
+ * Écrit seulement si la clé est absente. Retourne `true` si cet appel a écrit la valeur, `false` si une
+ * valeur existait déjà (écrite par un autre onglet) : l'appelant relit alors la valeur en place.
+ */
+export async function deviceStoreAdd(key: string, value: unknown): Promise<boolean> {
+  const db = await openDb();
+  if (!db) {
+    if (memoryFallback.has(key)) return false;
+    memoryFallback.set(key, value);
+    return true;
+  }
+  return new Promise<boolean>((resolve) => {
+    try {
+      const tx = db.transaction(STORE, 'readwrite');
+      const req = tx.objectStore(STORE).add(value, key);
+      req.onsuccess = () => resolve(true);
+      req.onerror = (event) => {
+        event.preventDefault(); // une clé déjà présente n'est pas une erreur fatale
+        resolve(false);
+      };
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 export async function deviceStoreDelete(key: string): Promise<void> {
   memoryFallback.delete(key);
   const db = await openDb();

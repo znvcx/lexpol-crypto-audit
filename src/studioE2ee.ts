@@ -25,6 +25,8 @@ import { decryptLegacyString, isLegacyCiphertext } from './studioCryptoLegacy';
 
 export const E2EE_SCHEME_VERSION = 2;
 export const RECORD_PREFIX = 'ENCv2:';
+/** Format v3 : le texte chiffré est lié à son enregistrement (collection, identifiant, échéance). */
+export const RECORD_PREFIX_V3 = 'ENCv3:';
 export const PBKDF2_MIN_ITERATIONS = 600_000;
 export const RECOVERY_PHRASE_WORD_COUNT = 24;
 export const UNREADABLE_PLACEHOLDER = '[Données chiffrées illisibles]';
@@ -92,6 +94,9 @@ export interface StudioCryptoDocument extends StudioKeyEnvelopes {
   createdAt: string;
   updatedAt: string;
   legacyMigratedAt?: string;
+  stylePromptMigratedAt?: string;
+  /** Date de la réécriture de tous les enregistrements au format ENCv3 (liés à leur enregistrement). */
+  recordBindingMigratedAt?: string;
   rotation?: StudioKeyRotation;
 }
 
@@ -274,6 +279,16 @@ export function pickConfirmationPositions(count = 3, total = RECOVERY_PHRASE_WOR
 // Clés d'enveloppe (KEK)
 // ---------------------------------------------------------------------------
 
+/** Le sel généré par l'application fait 16 octets : un document serveur modifié ne peut pas en imposer un autre. */
+function hasExpectedSalt(salt: unknown): boolean {
+  if (typeof salt !== 'string') return false;
+  try {
+    return base64ToBytes(salt).length === 16;
+  } catch {
+    return false;
+  }
+}
+
 export async function derivePasswordKek(
   password: string,
   params: PasswordKdfParams
@@ -281,7 +296,8 @@ export async function derivePasswordKek(
   if (
     params.name !== 'PBKDF2' ||
     params.hash !== 'SHA-256' ||
-    !(params.iterations >= PBKDF2_MIN_ITERATIONS)
+    !(params.iterations >= PBKDF2_MIN_ITERATIONS) ||
+    !hasExpectedSalt(params.salt)
   ) {
     throw new VaultCryptoError('kdf-params', 'Password KDF parameters below the required minimum');
   }
@@ -310,7 +326,12 @@ export async function derivePhraseKek(
   entropy: Uint8Array,
   params: PhraseKdfParams
 ): Promise<CryptoKey> {
-  if (params.name !== 'HKDF' || params.hash !== 'SHA-256') {
+  if (
+    params.name !== 'HKDF' ||
+    params.hash !== 'SHA-256' ||
+    params.info !== PHRASE_HKDF_INFO ||
+    !hasExpectedSalt(params.salt)
+  ) {
     throw new VaultCryptoError('kdf-params', 'Unsupported phrase KDF');
   }
   const base = await crypto.subtle.importKey('raw', entropy as BufferSource, 'HKDF', false, [
@@ -633,10 +654,16 @@ export async function unwrapDekFromDevice(
 // Chiffrement des enregistrements : ENCv2:<keyId>:<base64(IV || CT || tag)>
 // ---------------------------------------------------------------------------
 
+/**
+ * `context` identifie l'enregistrement (ex. `field_notes|<id>|<échéance>`) : il entre dans les données
+ * associées, un texte chiffré copié dans un autre enregistrement ne se déchiffre plus. Sans contexte,
+ * l'ancien format v2 est écrit (réservé aux appels qui ne connaissent pas l'enregistrement).
+ */
 export async function encryptRecordString(
   value: string,
   dek: StudioDek,
-  uid: string
+  uid: string,
+  context?: string
 ): Promise<string> {
   if (!value) return value;
   const iv = randomBytes(12);
@@ -645,7 +672,10 @@ export async function encryptRecordString(
       {
         name: 'AES-GCM',
         iv: iv as BufferSource,
-        additionalData: aad(uid, `record|${dek.keyId}`) as BufferSource,
+        additionalData: aad(
+          uid,
+          context ? `record3|${context}|${dek.keyId}` : `record|${dek.keyId}`
+        ) as BufferSource,
       },
       dek.key,
       utf8Encoder.encode(value) as BufferSource
@@ -654,10 +684,10 @@ export async function encryptRecordString(
   const payload = new Uint8Array(iv.length + ct.length);
   payload.set(iv, 0);
   payload.set(ct, iv.length);
-  return `${RECORD_PREFIX}${dek.keyId}:${bytesToBase64(payload)}`;
+  return `${context ? RECORD_PREFIX_V3 : RECORD_PREFIX}${dek.keyId}:${bytesToBase64(payload)}`;
 }
 
-export type RecordSource = 'v2' | 'legacy' | 'plain' | 'failed';
+export type RecordSource = 'v3' | 'v2' | 'legacy' | 'plain' | 'failed';
 
 export interface DecryptedValue {
   text: string;
@@ -668,11 +698,16 @@ export interface DecryptedValue {
 export async function decryptRecordString(
   value: string,
   ring: Map<string, CryptoKey>,
-  uid: string
+  uid: string,
+  strictV2 = false,
+  context?: string
 ): Promise<DecryptedValue> {
-  if (typeof value !== 'string' || !value) return { text: value, source: 'v2' };
-  if (value.startsWith(RECORD_PREFIX)) {
-    const rest = value.slice(RECORD_PREFIX.length);
+  if (typeof value !== 'string' || !value) return { text: value, source: 'v3' };
+  const isV3 = value.startsWith(RECORD_PREFIX_V3);
+  if (isV3 || value.startsWith(RECORD_PREFIX)) {
+    // Un texte v3 ne s'ouvre que dans l'enregistrement auquel il est lié
+    if (isV3 && !context) return { text: UNREADABLE_PLACEHOLDER, source: 'failed' };
+    const rest = value.slice((isV3 ? RECORD_PREFIX_V3 : RECORD_PREFIX).length);
     const sep = rest.indexOf(':');
     const keyId = sep > 0 ? rest.slice(0, sep) : '';
     const key = ring.get(keyId);
@@ -683,15 +718,22 @@ export async function decryptRecordString(
         {
           name: 'AES-GCM',
           iv: payload.subarray(0, 12) as BufferSource,
-          additionalData: aad(uid, `record|${keyId}`) as BufferSource,
+          additionalData: aad(
+            uid,
+            isV3 ? `record3|${context}|${keyId}` : `record|${keyId}`
+          ) as BufferSource,
         },
         key,
         payload.subarray(12) as BufferSource
       );
-      return { text: utf8Decoder.decode(plain), source: 'v2', keyId };
+      return { text: utf8Decoder.decode(plain), source: isV3 ? 'v3' : 'v2', keyId };
     } catch {
       return { text: UNREADABLE_PLACEHOLDER, source: 'failed', keyId };
     }
+  }
+  // Mode strict : après migration, refuse le texte en clair ou l'ancien ENCv1 injecté
+  if (strictV2) {
+    return { text: UNREADABLE_PLACEHOLDER, source: 'failed' };
   }
   if (isLegacyCiphertext(value)) {
     // Lecture de compatibilité de l'ancien schéma (voir studioCryptoLegacy.ts, point de retrait).
@@ -781,20 +823,14 @@ export async function mapDossierSensitiveFields(
   let analysisSnapshot = dossier.analysisSnapshot;
   if (analysisSnapshot) {
     if (typeof analysisSnapshot === 'object') {
-      try {
-        const encryptedStr = await fn(JSON.stringify(analysisSnapshot));
-        analysisSnapshot = encryptedStr as any;
-      } catch (err) {
-        console.warn('[E2EE] Could not encrypt analysisSnapshot:', err);
-      }
+      // Pas de repli : si le chiffrement échoue, l'écriture échoue, le contenu ne part jamais en clair.
+      analysisSnapshot = (await fn(JSON.stringify(analysisSnapshot))) as any;
     } else if (typeof analysisSnapshot === 'string') {
-      try {
-        const decryptedStr = await fn(analysisSnapshot);
-        if (decryptedStr) {
-          analysisSnapshot = JSON.parse(decryptedStr);
-        }
-      } catch (err) {
-        console.warn('[E2EE] Could not decrypt analysisSnapshot:', err);
+      const res = await fn(analysisSnapshot);
+      if (res && (res.startsWith('ENCv3:') || res.startsWith('ENCv2:') || res.startsWith('ENC:'))) {
+        analysisSnapshot = res as any;
+      } else if (res) {
+        analysisSnapshot = JSON.parse(res);
       }
     }
   }
@@ -826,6 +862,7 @@ export async function mapReformulationSensitiveFields(
     reformulatedText: await fn(record.reformulatedText),
     ...(record.title ? { title: await fn(record.title) } : {}),
     ...(record.summary ? { summary: await fn(record.summary) } : {}),
+    ...(record.stylePromptUsed ? { stylePromptUsed: await fn(record.stylePromptUsed) } : {}),
     ...(record.involvedEntities
       ? { involvedEntities: await mapEntitiesSensitiveFields(record.involvedEntities, fn) }
       : {}),
@@ -836,9 +873,12 @@ export interface RecordKeys {
   uid: string;
   active: StudioDek;
   ring: Map<string, CryptoKey>;
+  strictV2?: boolean;
 }
 
 export interface DecryptStats {
+  v3: number;
+  /** Ancien format ENCv2 (non lié à l'enregistrement) : lisible, à réécrire en v3. */
   v2: number;
   legacy: number;
   plain: number;
@@ -848,25 +888,48 @@ export interface DecryptStats {
 }
 
 function newStats(): DecryptStats {
-  return { v2: 0, legacy: 0, plain: 0, failed: 0, staleKey: 0 };
+  return { v3: 0, v2: 0, legacy: 0, plain: 0, failed: 0, staleKey: 0 };
 }
 
 /** Indique si l'enregistrement doit être réécrit avec la clé active (migration ou rotation). */
 export function needsReencryption(stats: DecryptStats): boolean {
-  return stats.failed === 0 && stats.legacy + stats.plain + stats.staleKey > 0;
+  return stats.failed === 0 && stats.v2 + stats.legacy + stats.plain + stats.staleKey > 0;
 }
 
-function decryptingMapper(keys: RecordKeys, stats: DecryptStats): StringMapper {
+function decryptingMapper(keys: RecordKeys, stats: DecryptStats, context?: string): StringMapper {
   return async (value) => {
-    const res = await decryptRecordString(value, keys.ring, keys.uid);
+    const res = await decryptRecordString(
+      value,
+      keys.ring,
+      keys.uid,
+      Boolean(keys.strictV2),
+      context
+    );
     if (value) stats[res.source]++;
-    if (res.source === 'v2' && res.keyId && res.keyId !== keys.active.keyId) stats.staleKey++;
+    if (
+      (res.source === 'v3' || res.source === 'v2') &&
+      res.keyId &&
+      res.keyId !== keys.active.keyId
+    )
+      stats.staleKey++;
     return res.text;
   };
 }
 
-function encryptingMapper(keys: RecordKeys): StringMapper {
-  return (value) => encryptRecordString(value, keys.active, keys.uid);
+function encryptingMapper(keys: RecordKeys, context?: string): StringMapper {
+  return (value) => encryptRecordString(value, keys.active, keys.uid, context);
+}
+
+/** Lie les textes chiffrés à leur enregistrement : collection, identifiant et, si elle existe, l'échéance. */
+export function recordContext(
+  collection: string,
+  id: unknown,
+  expiresAt?: unknown
+): string | undefined {
+  if (typeof id !== 'string' || !id) return undefined;
+  const expiry =
+    typeof expiresAt === 'number' || typeof expiresAt === 'string' ? `|${expiresAt}` : '';
+  return `${collection}|${id}${expiry}`;
 }
 
 export async function encryptDossierForStorage(
@@ -887,7 +950,10 @@ export async function encryptDossierForStorage(
         : r
     ),
   };
-  return mapDossierSensitiveFields(bounded, encryptingMapper(keys));
+  return mapDossierSensitiveFields(
+    bounded,
+    encryptingMapper(keys, recordContext('dossiers', dossier.id))
+  );
 }
 
 export async function decryptDossierFromStorage(
@@ -895,7 +961,10 @@ export async function decryptDossierFromStorage(
   keys: RecordKeys
 ): Promise<{ value: Dossier; stats: DecryptStats }> {
   const stats = newStats();
-  const value = await mapDossierSensitiveFields(dossier, decryptingMapper(keys, stats));
+  const value = await mapDossierSensitiveFields(
+    dossier,
+    decryptingMapper(keys, stats, recordContext('dossiers', dossier?.id))
+  );
   return { value, stats };
 }
 
@@ -903,7 +972,10 @@ export async function encryptReformulationForStorage(
   record: ReformulationRecord,
   keys: RecordKeys
 ): Promise<ReformulationRecord> {
-  return mapReformulationSensitiveFields(record, encryptingMapper(keys));
+  return mapReformulationSensitiveFields(
+    record,
+    encryptingMapper(keys, recordContext('reformulations', record.id))
+  );
 }
 
 export async function decryptReformulationFromStorage(
@@ -911,7 +983,10 @@ export async function decryptReformulationFromStorage(
   keys: RecordKeys
 ): Promise<{ value: ReformulationRecord; stats: DecryptStats }> {
   const stats = newStats();
-  const value = await mapReformulationSensitiveFields(record, decryptingMapper(keys, stats));
+  const value = await mapReformulationSensitiveFields(
+    record,
+    decryptingMapper(keys, stats, recordContext('reformulations', record?.id))
+  );
   return { value, stats };
 }
 
@@ -950,7 +1025,10 @@ export async function encryptFieldNoteForStorage(
     if (content[key] !== undefined) stored[key] = content[key];
     delete content[key];
   }
-  stored.payload = await encryptingMapper(keys)(JSON.stringify(content));
+  stored.payload = await encryptingMapper(
+    keys,
+    recordContext('field_notes', note.id, note.expiresAt)
+  )(JSON.stringify(content));
   return stored as unknown as StoredFieldNote;
 }
 
@@ -959,7 +1037,11 @@ export async function decryptFieldNoteFromStorage(
   keys: RecordKeys
 ): Promise<{ value: FieldNote | null; stats: DecryptStats }> {
   const stats = newStats();
-  const text = await decryptingMapper(keys, stats)(String(stored?.payload || ''));
+  const text = await decryptingMapper(
+    keys,
+    stats,
+    recordContext('field_notes', stored?.id, stored?.expiresAt)
+  )(String(stored?.payload || ''));
   if (stats.failed > 0 || !text) return { value: null, stats };
   try {
     const content = JSON.parse(text) as Partial<FieldNote>;
@@ -1001,7 +1083,10 @@ export async function encryptAnalysisForStorage(
     compendiumCheck: record.compendiumCheck || (record.data as any)?.compendiumCheck || undefined,
     groundingSources: record.groundingSources || undefined,
   };
-  const encryptedPayload = await encryptingMapper(keys)(JSON.stringify(sensitive));
+  const encryptedPayload = await encryptingMapper(
+    keys,
+    recordContext('analyses', record.id, record.expiresAt)
+  )(JSON.stringify(sensitive));
   return {
     id: record.id,
     userId: keys.uid,
@@ -1015,6 +1100,7 @@ export async function encryptAnalysisForStorage(
     encryptedPayload,
     isPro: record.isPro,
     dossierId: record.dossierId || undefined,
+    noteId: record.noteId || undefined,
   };
 }
 
@@ -1028,7 +1114,11 @@ export async function decryptAnalysisFromStorage(
     return { value: null, stats };
   }
   if (stored.encryptedPayload) {
-    const text = await decryptingMapper(keys, stats)(String(stored.encryptedPayload));
+    const text = await decryptingMapper(
+      keys,
+      stats,
+      recordContext('analyses', stored.id, stored.expiresAt)
+    )(String(stored.encryptedPayload));
     if (stats.failed > 0 || !text) return { value: null, stats };
     try {
       const sensitive = JSON.parse(text);
@@ -1080,7 +1170,10 @@ export async function encryptLandmarkForStorage(
     notes: landmark.notes ? landmark.notes.slice(0, 500) : undefined,
     location: landmark.location,
   };
-  const payload = await encryptingMapper(keys)(JSON.stringify(content));
+  const payload = await encryptingMapper(
+    keys,
+    recordContext('landmarks', landmark.id)
+  )(JSON.stringify(content));
   return {
     id: landmark.id,
     userId: keys.uid,
@@ -1099,7 +1192,11 @@ export async function decryptLandmarkFromStorage(
     return { value: null, stats };
   }
   if (typeof stored.payload === 'string' && stored.payload.length > 0) {
-    const text = await decryptingMapper(keys, stats)(stored.payload);
+    const text = await decryptingMapper(
+      keys,
+      stats,
+      recordContext('landmarks', stored.id)
+    )(stored.payload);
     if (stats.failed > 0 || !text) return { value: null, stats };
     try {
       const content = JSON.parse(text);

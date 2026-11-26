@@ -889,3 +889,89 @@ export function anonymizeSituation(text: string): string {
 
   return sanitized;
 }
+
+/** Type d'alias proposé pour une donnée repérée dans un texte. */
+export type SensitiveSpanType = 'person' | 'vehicle' | 'place' | 'date' | 'other';
+
+/** Donnée repérée dans un texte, avec sa position (pour la surligner) et le type d'alias proposé. */
+export interface SensitiveSpan {
+  start: number;
+  end: number;
+  value: string;
+  type: SensitiveSpanType;
+}
+
+const DATE_IN_MATCH = /\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/;
+
+/**
+ * Repère les données qui semblent identifiantes (mêmes motifs que `detectSensitiveData`) et
+ * renvoie leur position. Les chevauchements sont écartés : le premier motif trouvé l'emporte. Les
+ * alias (`[PERSONNE_01_NAME]`…) ne sont jamais repérés : appliquée au texte masqué d'une note, la
+ * fonction ne renvoie donc que ce qui n'est pas encore dans les fiches.
+ */
+export function findSensitiveSpans(text: string): SensitiveSpan[] {
+  if (!text || text.trim().length < 4) return [];
+  const spans: SensitiveSpan[] = [];
+  const overlaps = (start: number, end: number) =>
+    spans.some((s) => start < s.end && end > s.start);
+  const add = (start: number, raw: string, type: SensitiveSpanType) => {
+    const lead = raw.length - raw.trimStart().length;
+    const value = raw.trim();
+    if (value.length < 2) return;
+    const from = start + lead;
+    const to = from + value.length;
+    if (overlaps(from, to)) return;
+    spans.push({ start: from, end: to, value, type });
+  };
+  const scan = (
+    regex: RegExp,
+    type: SensitiveSpanType,
+    pick: (m: RegExpMatchArray) => { offset: number; value: string } | null = (m) => ({
+      offset: 0,
+      value: m[0],
+    })
+  ) => {
+    const flags = regex.flags.includes('g') ? regex.flags : `${regex.flags}g`;
+    for (const m of text.matchAll(new RegExp(regex.source, flags))) {
+      const picked = pick(m);
+      if (picked && m.index !== undefined) add(m.index + picked.offset, picked.value, type);
+    }
+  };
+  // Le nom suit la formule (« Monsieur », « le prévenu ») : seul le nom est repris.
+  const trailingName = (m: RegExpMatchArray) =>
+    m[2] ? { offset: m[0].length - m[2].length, value: m[2] } : null;
+
+  scan(SWISS_AVS_REGEX, 'other');
+  scan(SWISS_IBAN_REGEX, 'other');
+  scan(EMAIL_REGEX, 'other');
+  scan(SWISS_PHONE_REGEX, 'other');
+  scan(POLICE_REF_REGEX, 'other');
+  scan(VIN_REGEX, 'vehicle');
+  scan(SWISS_PLATE_REGEX, 'vehicle');
+  scan(CIVIL_STATUS_REGEX, 'person', trailingName);
+  scan(POLICE_JARGON_NAME_REGEX, 'person', trailingName);
+  scan(DOB_REGEX, 'date', (m) => {
+    const date = DATE_IN_MATCH.exec(m[0]);
+    return date ? { offset: date.index, value: date[0] } : null;
+  });
+  scan(STREET_ADDRESS_REGEX, 'place');
+  scan(CAPITALIZED_PAIR_REGEX, 'person', (m) =>
+    isStandalonePersonNamePair(m[1], m[2]) ? { offset: 0, value: m[0] } : null
+  );
+  return spans.sort((a, b) => a.start - b.start);
+}
+
+/** Données repérées, une fois chacune (sans tenir compte de la casse), dans l'ordre du texte. */
+export function findSensitiveCandidates(
+  text: string
+): Array<{ value: string; type: SensitiveSpanType }> {
+  const seen = new Set<string>();
+  const out: Array<{ value: string; type: SensitiveSpanType }> = [];
+  for (const span of findSensitiveSpans(text)) {
+    const key = span.value.toLocaleLowerCase('fr-CH');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ value: span.value, type: span.type });
+  }
+  return out;
+}

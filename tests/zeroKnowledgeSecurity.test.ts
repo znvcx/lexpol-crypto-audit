@@ -8,15 +8,13 @@ import {
   encryptLandmarkForStorage,
   generateDek,
   needsReencryption,
-  RECORD_PREFIX,
+  RECORD_PREFIX_V3,
   RecordKeys,
 } from '../utils/studioE2ee';
 import {
-  hydrateDossierWithLocalIdentities,
   hydrateFieldNoteWithLocalIdentities,
   hydrateReformulationWithLocalIdentities,
   isLocalIdentitiesOnlyEnabled,
-  prepareDossierForCloudSync,
   prepareFieldNoteForCloudSync,
   prepareReformulationForCloudSync,
   setLocalIdentitiesOnlyEnabled,
@@ -63,7 +61,7 @@ describe('Zero-Knowledge Security & Official Secrecy (Art. 320 CP)', () => {
       expect(encrypted.data).toEqual({});
       expect(encrypted.userEmail).toBeUndefined();
       expect(encrypted.userDisplayName).toBeUndefined();
-      expect(encrypted.encryptedPayload?.startsWith(RECORD_PREFIX)).toBe(true);
+      expect(encrypted.encryptedPayload?.startsWith(RECORD_PREFIX_V3)).toBe(true);
       expect(JSON.stringify(encrypted)).not.toContain('Qualification LCR');
       expect(JSON.stringify(encrypted)).not.toContain('agent@police.ch');
 
@@ -116,7 +114,7 @@ describe('Zero-Knowledge Security & Official Secrecy (Art. 320 CP)', () => {
       };
 
       const stored = await encryptLandmarkForStorage(landmark, keys);
-      expect(stored.payload.startsWith(RECORD_PREFIX)).toBe(true);
+      expect(stored.payload.startsWith(RECORD_PREFIX_V3)).toBe(true);
       expect(JSON.stringify(stored)).not.toContain('Lausanne');
       expect(JSON.stringify(stored)).not.toContain('observation discrète');
 
@@ -150,8 +148,8 @@ describe('Zero-Knowledge Security & Official Secrecy (Art. 320 CP)', () => {
       const encrypted = await encryptDossierForStorage(dossier, keys);
       expect(JSON.stringify(encrypted)).not.toContain('Opération Cristal');
       expect(JSON.stringify(encrypted)).not.toContain('Informateur');
-      expect(encrypted.tags[0].startsWith(RECORD_PREFIX)).toBe(true);
-      expect(encrypted.customFields?.[0].label.startsWith(RECORD_PREFIX)).toBe(true);
+      expect(encrypted.tags[0].startsWith(RECORD_PREFIX_V3)).toBe(true);
+      expect(encrypted.customFields?.[0].label.startsWith(RECORD_PREFIX_V3)).toBe(true);
 
       const { value: decrypted } = await decryptDossierFromStorage(encrypted, keys);
       expect(decrypted.tags).toEqual(['Opération Cristal', 'Secteur Gare']);
@@ -245,38 +243,6 @@ describe('Zero-Knowledge Security & Official Secrecy (Art. 320 CP)', () => {
       expect(JSON.stringify(cloudReport)).not.toContain('Krasniqi');
       const rehydratedReport = hydrateReformulationWithLocalIdentities(cloudReport);
       expect(rehydratedReport.involvedEntities?.[0].realName).toBe('Krasniqi Arben');
-
-      const dossier: Dossier = {
-        id: 'dos_secret_1',
-        reference: 'DOS-2026-9999',
-        userId: 'u1',
-        title: 'Dossier test',
-        description: '',
-        category: 'autre',
-        status: 'en_cours',
-        urgency: 'normale',
-        tags: [],
-        tasks: [],
-        logs: [],
-        reports: [
-          {
-            id: 'r1',
-            title: 'Rapport',
-            text: '[PERSON_01]',
-            updatedAt: new Date().toISOString(),
-            involvedEntities: [
-              { id: 'e1', type: 'person', alias: '[PERSON_01]', realName: 'Krasniqi Arben' },
-            ],
-          } as any,
-        ],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        expiresAt: Date.now() + 86400000,
-      };
-      const cloudDossier = await prepareDossierForCloudSync(dossier);
-      expect(JSON.stringify(cloudDossier)).not.toContain('Krasniqi');
-      const rehydratedDossier = hydrateDossierWithLocalIdentities(cloudDossier);
-      expect(rehydratedDossier.reports?.[0].involvedEntities?.[0].realName).toBe('Krasniqi Arben');
 
       await setLocalIdentitiesOnlyEnabled(false);
     });

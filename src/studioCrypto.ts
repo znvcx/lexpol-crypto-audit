@@ -22,10 +22,10 @@ import {
   LEGACY_DEVICE_SECRET_STORAGE_KEY,
 } from './studioCryptoLegacy';
 import {
+  deviceStoreAdd,
   deviceStoreDelete,
   deviceStoreDeletePrefix,
   deviceStoreGet,
-  deviceStoreSet,
 } from './vaultDeviceStore';
 import { base64ToBytes, bytesToBase64, randomBytes } from './studioE2ee';
 
@@ -77,8 +77,10 @@ function getDeviceKey(): Promise<CryptoKey> {
         'encrypt',
         'decrypt',
       ])) as CryptoKey;
-      await deviceStoreSet(DEVICE_LOCAL_KEY_ID, key);
-      return key;
+      // Écriture « seulement si absente » : si un autre onglet a créé la clé entre-temps, c'est la sienne
+      // qui fait foi (sinon la dernière écrite gagnerait et le cache chiffré par l'autre deviendrait illisible).
+      if (await deviceStoreAdd(DEVICE_LOCAL_KEY_ID, key)) return key;
+      return (await deviceStoreGet<CryptoKey>(DEVICE_LOCAL_KEY_ID)) ?? key;
     })();
     deviceKeyPromise.catch(() => {
       deviceKeyPromise = null;
@@ -87,8 +89,20 @@ function getDeviceKey(): Promise<CryptoKey> {
   return deviceKeyPromise;
 }
 
-function localAad(storageKey: string): BufferSource {
-  return utf8Encoder.encode(`lexpol.ch/local-vault|v2|${storageKey}`) as BufferSource;
+/** Compte actif sur ce navigateur (posé par enforceUserSessionIsolation) ; vide tant qu'il est inconnu. */
+function activeUid(): string {
+  try {
+    return localStorage.getItem(ACTIVE_UID_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+/** AAD du cache local : lie la clé de stockage et le compte. `uid` vide = ancien AAD (lecture de compatibilité). */
+function localAad(storageKey: string, uid = activeUid()): BufferSource {
+  return utf8Encoder.encode(
+    uid ? `lexpol.ch/local-vault|v2|${uid}|${storageKey}` : `lexpol.ch/local-vault|v2|${storageKey}`
+  ) as BufferSource;
 }
 
 async function encryptLocal(storageKey: string, json: string): Promise<string> {
@@ -111,16 +125,23 @@ async function decryptLocal(storageKey: string, raw: string): Promise<string | n
   try {
     const key = await getDeviceKey();
     const payload = base64ToBytes(raw.slice(LOCAL_VAULT_PREFIX.length));
-    const plain = await crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv: payload.subarray(0, 12) as BufferSource,
-        additionalData: localAad(storageKey),
-      },
-      key,
-      payload.subarray(12) as BufferSource
-    );
-    return utf8Decoder.decode(plain);
+    // AAD avec le compte d'abord ; à défaut, ancien AAD sans compte (écrit avant cette liaison), réécrit ensuite.
+    const candidates = activeUid()
+      ? [localAad(storageKey), localAad(storageKey, '')]
+      : [localAad(storageKey, '')];
+    for (const additionalData of candidates) {
+      try {
+        const plain = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: payload.subarray(0, 12) as BufferSource, additionalData },
+          key,
+          payload.subarray(12) as BufferSource
+        );
+        return utf8Decoder.decode(plain);
+      } catch {
+        // essai suivant
+      }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -266,6 +287,8 @@ export function purgeSensitiveStudioStorage(): Promise<void> {
     try {
       for (const key of LOCAL_VAULT_KEYS) localStorage.removeItem(key);
       localStorage.removeItem('lexpol_history_v1');
+      // Dernières adresses cherchées sur la carte (clé de SwissAddressSearch) : données de terrain.
+      localStorage.removeItem('lexpol_recent_geo_searches');
       localStorage.removeItem(LEGACY_DEVICE_SECRET_STORAGE_KEY);
       localStorage.removeItem(ACTIVE_UID_STORAGE_KEY);
     } catch {
